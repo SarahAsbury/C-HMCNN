@@ -1,25 +1,21 @@
 import os
-import importlib
 os.environ["DATA_FOLDER"] = "./"
 
 import argparse
+import random
 
+import numpy as np
 import torch
 import torch.utils.data
 import torch.nn as nn
 
-from utils.parser import *
-from utils import datasets
-import random
-import sys
-
-from sklearn.impute import SimpleImputer
-
 from sklearn import preprocessing
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import average_precision_score
 
+import pandas as pd
+from imc_cellannot_utils import load_data, load_cell_ontology, compute_R, plot_ontology, propagate_labels
 
-from sklearn.metrics import f1_score, average_precision_score, precision_recall_curve, roc_auc_score, auc
 
 def get_constr_out(x, R):
     """ Given the output of the neural network x returns the output of MCM given the hierarchy constraint expressed in the matrix R """
@@ -35,10 +31,10 @@ class ConstrainedFFNNModel(nn.Module):
     """ C-HMCNN(h) model - during training it returns the not-constrained output that is then passed to MCLoss """
     def __init__(self, input_dim, hidden_dim, output_dim, hyperparams, R):
         super(ConstrainedFFNNModel, self).__init__()
-        
+
         self.nb_layers = hyperparams['num_layers']
         self.R = R
-        
+
         fc = []
         for i in range(self.nb_layers):
             if i == 0:
@@ -48,16 +44,16 @@ class ConstrainedFFNNModel(nn.Module):
             else:
                 fc.append(nn.Linear(hidden_dim, hidden_dim))
         self.fc = nn.ModuleList(fc)
-        
+
         self.drop = nn.Dropout(hyperparams['dropout'])
-        
-        
+
+
         self.sigmoid = nn.Sigmoid()
         if hyperparams['non_lin'] == 'tanh':
             self.f = nn.Tanh()
         else:
             self.f = nn.ReLU()
-        
+
     def forward(self, x):
         for i in range(self.nb_layers):
             if i == self.nb_layers-1:
@@ -75,10 +71,20 @@ def main():
 
     # Training settings
     parser = argparse.ArgumentParser(description='Train neural network')
-    
+
     # Required  parameters
-    parser.add_argument('--dataset', type=str, required=True,
-                        help='dataset')
+    parser.add_argument('--X', type=str, required=True,
+                        help='path to feature matrix (.npy, .csv, or .parquet)')
+    parser.add_argument('--Y', type=str, required=True,
+                        help='path to label matrix (.csv, or .parquet); .csv/.parquet column names are used as node names for --rm_root_nodes matching')
+    parser.add_argument('--ontology', type=str, required=True,
+                        help='path to cl.obo (Cell Ontology in OBO format)')
+    parser.add_argument('--extra_nodes', type=str, nargs='*', default=None,
+                        help='non-ontology labels to add as isolated nodes with no hierarchy constraints (e.g. empty unknown)')
+    parser.add_argument('--run_name', type=str, required=True,
+                        help='name for this run, used as the logs subfolder')
+    
+    # hyper parameters
     parser.add_argument('--batch_size', type=int, required=True,
                         help='input batch size for training')
     parser.add_argument('--lr', type=float, required=True,
@@ -94,34 +100,22 @@ def main():
     parser.add_argument('--non_lin', type=str, required=True,
                         help='non linearity function to be used in the hidden layers')
 
-    # Other parameters 
+    # Other parameters
+    parser.add_argument('--rm_root_nodes', type=str, nargs='*', default=[],
+                    help='node names to exclude from loss and scoring (e.g. root GO0003674); requires Y in .csv or .parquet format')
+    parser.add_argument('--val_ratio', type=float, default=0.3,
+                        help='fraction of the data held out for validation (default: 0.3)')
     parser.add_argument('--device', type=int, default=0,
                         help='device (default:0)')
     parser.add_argument('--num_epochs', type=int, default=2000,
                         help='Max number of epochs to train (default:2000)')
     parser.add_argument('--seed', type=int, default=0,
                         help='random seed (default:0)')
+    parser.add_argument('--debug', action='store_true',
+                        help='write debug outputs (e.g. ontology plot) to the logs folder')
 
     args = parser.parse_args()
     hyperparams = {'batch_size':args.batch_size, 'num_layers':args.num_layers, 'dropout':args.dropout, 'non_lin':args.non_lin, 'hidden_dim':args.hidden_dim, 'lr':args.lr, 'weight_decay':args.weight_decay}
-
-    assert('_' in args.dataset)
-    assert('FUN' in args.dataset or 'GO' in args.dataset or 'others' in args.dataset)
-
-
-    # Load train, val and test set
-    dataset_name = args.dataset
-    data = dataset_name.split('_')[0]
-    ontology = dataset_name.split('_')[1]
-
-
-   # Dictionaries with number of features and number of labels for each dataset
-    input_dims = {'diatoms':371, 'enron':1001,'imclef07a': 80, 'imclef07d': 80,'cellcycle':77, 'church':27, 'derisi':63, 'eisen':79, 'expr':561, 'gasch1':173, 'gasch2':52, 'hom':47034, 'seq':529, 'spo':86}
-    output_dims_FUN = {'cellcycle':499, 'church':499, 'derisi':499, 'eisen':461, 'expr':499, 'gasch1':499, 'gasch2':499, 'hom':499, 'seq':499, 'spo':499}
-    output_dims_GO = {'cellcycle':4122, 'church':4122, 'derisi':4116, 'eisen':3570, 'expr':4128, 'gasch1':4122, 'gasch2':4128, 'hom':4128, 'seq':4130, 'spo':4116}
-    output_dims_others = {'diatoms':398,'enron':56, 'imclef07a': 96, 'imclef07d': 46, 'reuters':102}
-    output_dims = {'FUN':output_dims_FUN, 'GO':output_dims_GO, 'others':output_dims_others}
-
 
     # Set seed
     seed = args.seed
@@ -135,79 +129,79 @@ def main():
     # Pick device
     device = torch.device("cuda:"+str(args.device) if torch.cuda.is_available() else "cpu")
 
-    # Load the datasets
-    if ('others' in args.dataset):
-        train, test = initialize_other_dataset(dataset_name, datasets)
-        train.to_eval, test.to_eval = torch.tensor(train.to_eval, dtype=torch.uint8),  torch.tensor(test.to_eval, dtype=torch.uint8)
-        train.X, valX, train.Y, valY = train_test_split(train.X, train.Y, test_size=0.30, random_state=seed)
-    else:
-        train, val, test = initialize_dataset(dataset_name, datasets)
-        train.to_eval, val.to_eval, test.to_eval = torch.tensor(train.to_eval, dtype=torch.uint8), torch.tensor(val.to_eval, dtype=torch.uint8), torch.tensor(test.to_eval, dtype=torch.uint8)
+    # Load X
+    X = load_data(args.X)
     
-    different_from_0 = torch.tensor(np.array((test.Y.sum(0)!=0), dtype = np.uint8), dtype=torch.uint8)
+    # Load Y
+    Y = load_data(args.Y)
+    if not isinstance(Y, pd.DataFrame):
+        raise ValueError(f"Y must be a .csv or .parquet file with column names — got {args.Y!r}")
 
-    # Compute matrix of ancestors R
-    # Given n classes, R is an (n x n) matrix where R_ij = 1 if class i is ancestor of class j
-    R = np.zeros(train.A.shape)
-    np.fill_diagonal(R, 1)
-    g = nx.DiGraph(train.A)
-    for i in range(len(train.A)):
-        descendants = list(nx.descendants(g, i))
-        if descendants:
-            R[i, descendants] = 1
-    R = torch.tensor(R)
-    #Transpose to get the ancestors for each node 
-    R = R.transpose(1, 0)
-    R = R.unsqueeze(0).to(device)
+    # Load ontology (pruned to Y columns + all their ancestors)
+    initial_nodes = list(Y.columns)
+    extra_nodes = set(args.extra_nodes) if args.extra_nodes else set()
+    ontology_nodes = [n for n in initial_nodes if n not in extra_nodes]
+    g = load_cell_ontology(args.ontology, nodes=ontology_nodes, extra_nodes=args.extra_nodes)
+
+    if args.debug:
+        plot_ontology(g, output_path=f"logs/{args.run_name}/ontology.html")
+
+    # Include all ancestor nodes of Y and propoagate positive labels updward (e.g. CD8+ T cell → T cell = 1, lymphocyte = 1, leukocyte = 1, ...)
+    Y = propagate_labels(Y, g)
+
+    # Remove requested root nodes from loss and scoring
+    if args.rm_root_nodes:
+        missing = set(args.rm_root_nodes) - set(Y.columns)
+        if missing:
+            raise ValueError(f"--rm_root_nodes contains names not found in Y columns: {sorted(missing)}")
+    to_eval = ~Y.columns.isin(args.rm_root_nodes)
+    
+    # Y data management for input
+    Y = Y.values                # only Y values for model input
+    nodes = list(Y.columns)     # use expanded nodes for hierarchy
+
+    # Build R from expanded full node set
+    R = torch.tensor(compute_R(g, nodes)).unsqueeze(0).to(device)                               # R_ij = 1 if i is an ancestor of j. Shape (1, n(nodes), n(nodes)) for broadcasting to batch dimension
 
 
-    # Rescale dataset and impute missing data
-    if ('others' in args.dataset):
-        scaler = preprocessing.StandardScaler().fit((train.X))
-        imp_mean = SimpleImputer(missing_values=np.nan, strategy='mean').fit((train.X))
-        train.X, train.Y = torch.tensor(scaler.transform(imp_mean.transform(train.X))).to(device), torch.tensor(train.Y).to(device)
-        valX, valY = torch.tensor(scaler.transform(imp_mean.transform(valX))).to(device), torch.tensor(valY).to(device)
-    else:
-        scaler = preprocessing.StandardScaler().fit(np.concatenate((train.X, val.X)))
-        imp_mean = SimpleImputer(missing_values=np.nan, strategy='mean').fit(np.concatenate((train.X, val.X)))
-        val.X, val.Y = torch.tensor(scaler.transform(imp_mean.transform(val.X))).to(device), torch.tensor(val.Y).to(device)
-        train.X, train.Y = torch.tensor(scaler.transform(imp_mean.transform(train.X))).to(device), torch.tensor(train.Y).to(device)        
+    # Train/val split (after label propagation so propagated labels are consistent across splits)
+    train_X, val_X, train_Y, val_Y = train_test_split(X, Y, test_size=args.val_ratio, random_state=seed)
 
-    # Create loaders 
-    train_dataset = [(x, y) for (x, y) in zip(train.X, train.Y)]
-    if ('others' in args.dataset):
-        val_dataset = [(x, y) for (x, y) in zip(valX, valY)]
-    else:
-        val_dataset = [(x, y) for (x, y) in zip(val.X, val.Y)]
+    # scale and send to tensors to device (e.g gpu)
+    scaler = preprocessing.StandardScaler().fit(train_X)                                        # z-score scale X
+    train_X = torch.tensor(scaler.transform(train_X)).to(device)
+    val_X = torch.tensor(scaler.transform(val_X)).to(device)
+    train_Y = torch.tensor(train_Y).to(device)
+    val_Y = torch.tensor(val_Y).to(device)
 
-    train_loader = torch.utils.data.DataLoader(dataset=train_dataset, 
-                                            batch_size=args.batch_size, 
+    # Create loaders
+    train_dataset = [(x, y) for (x, y) in zip(train_X, train_Y)]
+    val_dataset = [(x, y) for (x, y) in zip(val_X, val_Y)]
+
+    train_loader = torch.utils.data.DataLoader(dataset=train_dataset,
+                                            batch_size=args.batch_size,
                                             shuffle=True)
 
-    val_loader = torch.utils.data.DataLoader(dataset=val_dataset, 
-                                            batch_size=args.batch_size, 
+    val_loader = torch.utils.data.DataLoader(dataset=val_dataset,
+                                            batch_size=args.batch_size,
                                             shuffle=False)
 
 
     num_epochs = args.num_epochs
-    if 'GO' in dataset_name: 
-        num_to_skip = 4
-    else:
-        num_to_skip = 1 
 
     # Create the model
-    model = ConstrainedFFNNModel(input_dims[data], args.hidden_dim, output_dims[ontology][data]+num_to_skip, hyperparams, R)
+    model = ConstrainedFFNNModel(X.shape[1], args.hidden_dim, Y.shape[1], hyperparams, R)
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay) 
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.BCELoss()
 
-    # Set patience 
+    # Set patience
     patience, max_patience = 20, 20
     max_score = 0.0
 
-    # Create folder for the dataset (if it does not exist)
-    if not os.path.exists('logs/'+str(dataset_name)+'/'):
-         os.makedirs('logs/'+str(dataset_name)+'/')
+    # Create folder for this run (if it does not exist)
+    if not os.path.exists('logs/'+str(args.run_name)+'/'):
+         os.makedirs('logs/'+str(args.run_name)+'/')
 
     for epoch in range(num_epochs):
         total_train = 0.0
@@ -224,27 +218,28 @@ def main():
             # Clear gradients w.r.t. parameters
             optimizer.zero_grad()
             output = model(x.float())
-        
+
+            # MCLoss
             constr_output = get_constr_out(output, R)
             train_output = labels*output.double()
             train_output = get_constr_out(train_output, R)
             train_output = (1-labels)*constr_output.double() + labels*train_output
-            loss = criterion(train_output[:,train.to_eval], labels[:,train.to_eval]) 
+            loss = criterion(train_output[:, to_eval], labels[:, to_eval])
             predicted = constr_output.data > 0.5
             # Total number of labels
             total_train += labels.size(0) * labels.size(1)
             # Total correct predictions
             correct_train += (predicted == labels.byte()).sum()
-                    
+
             # Getting gradients w.r.t. parameters
             loss.backward()
             # Updating parameters
             optimizer.step()
-            
+
         model.eval()
         constr_output = constr_output.to('cpu')
         labels = labels.to('cpu')
-        train_score = average_precision_score(labels[:,train.to_eval], constr_output.data[:,train.to_eval], average='micro') 
+        train_score = average_precision_score(labels[:, to_eval], constr_output.data[:, to_eval], average='micro')
 
         for i, (x,y) in enumerate(val_loader):
             x = x.to(device)
@@ -268,15 +263,15 @@ def main():
                 constr_val = torch.cat((constr_val, cpu_constrained_output), dim=0)
                 y_val = torch.cat((y_val, y), dim =0)
 
-        score = average_precision_score(y_val[:,train.to_eval], constr_val.data[:,train.to_eval], average='micro') 
-        
+        score = average_precision_score(y_val[:, to_eval], constr_val.data[:, to_eval], average='micro')
+
         if score >= max_score:
             patience = max_patience
             max_score = score
         else:
             patience = patience - 1
-        
-        floss= open('logs/'+str(dataset_name)+'/measures_batch_size_'+str(args.batch_size)+'_lr_'+str(args.lr)+'_weight_decay_'+str(args.weight_decay)+'_seed_'+str(args.seed)+'_num_layers_'+str(args.num_layers)+'._hidden_dim_'+str(args.hidden_dim)+'_dropout_'+str(args.dropout)+'_'+args.non_lin, 'a')
+
+        floss= open('logs/'+str(args.run_name)+'/measures_batch_size_'+str(args.batch_size)+'_lr_'+str(args.lr)+'_weight_decay_'+str(args.weight_decay)+'_seed_'+str(args.seed)+'_num_layers_'+str(args.num_layers)+'._hidden_dim_'+str(args.hidden_dim)+'_dropout_'+str(args.dropout)+'_'+args.non_lin, 'a')
         floss.write('\nEpoch: {} - Loss: {:.4f}, Accuracy train: {:.5f}, Accuracy: {:.5f}, Precision score: ({:.5f})\n'.format(epoch,
                     loss, float(correct_train)/float(total_train), float(correct)/float(total), score))
         floss.close()
