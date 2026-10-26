@@ -180,19 +180,20 @@ def main():
     # Include all ancestor nodes of Y and propoagate positive labels updward (e.g. CD8+ T cell → T cell = 1, lymphocyte = 1, leukocyte = 1, ...)
     Y = propagate_labels(Y, g)
 
-    # Sanity check: no label may be True for every pixel
+    # Sanity check: no label may be the same (all True or all False) for every pixel
     invariant_labels = (
         Y.select(pl.all()                            # across all cols
-                 .all()                              # check if all true
+                 .n_unique() == 1                    # check if only one value (all True or all False)
                  )
          .unpivot()                                  # long format: variable (label) | value (bool)
-         .filter(pl.col("value"))                    # keep labels that are True for every pixel
+         .filter(pl.col("value"))                    # keep labels with no variation
          .get_column("variable").to_list()
     )
     if invariant_labels:
         raise ValueError(
-            f"Labels True for every pixel after propagation: {invariant_labels}. "
-            f"Use the preprocessed ontology (preprocess_ontology drops the common ancestors of all labels)."
+            f"Labels with no variation (all True or all False) after propagation: {invariant_labels}. "
+            f"Use the preprocessed ontology (preprocess_ontology drops the common ancestors of all labels) "
+            f"and drop labels with no positive pixels at data prep."
         )
 
     # Y data management for input
