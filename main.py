@@ -95,8 +95,8 @@ def main():
 
     # Load train, val and test set
     dataset_name = args.dataset
-    data = dataset_name.split('_')[0]
-    ontology = dataset_name.split('_')[1]
+    data = dataset_name.split('_')[0]       # dataset name (e.g diatoms, enron, imclef07a, imclef07d, cellcycle, derisi, eisen, expr, gasch1, gasch2, seq, spo)
+    ontology = dataset_name.split('_')[1]   # ontology name (GO, FUN, others)
 
     # Dictionaries with number of features and number of labels for each dataset
     input_dims = {'diatoms':371, 'enron':1001,'imclef07a': 80, 'imclef07d': 80,'cellcycle':77, 'derisi':63, 'eisen':79, 'expr':561, 'gasch1':173, 'gasch2':52, 'seq':529, 'spo':86}
