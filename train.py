@@ -13,8 +13,23 @@ from sklearn import preprocessing
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import average_precision_score
 
-import pandas as pd
-from imc_cellannot_utils import load_data, load_cell_ontology, compute_R, plot_ontology, propagate_labels
+import json
+import networkx as nx
+import polars as pl
+from imc_cellannot_utils import load_data, compute_R, plot_ontology, propagate_labels
+
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
+# hidden-layer activation functions selectable via --activation
+ACTIVATIONS = {
+    'relu': nn.ReLU,
+    'leaky_relu': nn.LeakyReLU,
+    'tanh': nn.Tanh,
+}
 
 
 def get_constr_out(x, R):
@@ -49,10 +64,7 @@ class ConstrainedFFNNModel(nn.Module):
 
 
         self.sigmoid = nn.Sigmoid()
-        if hyperparams['non_lin'] == 'tanh':
-            self.f = nn.Tanh()
-        else:
-            self.f = nn.ReLU()
+        self.f = ACTIVATIONS[hyperparams['activation']]()
 
     def forward(self, x):
         for i in range(self.nb_layers):
@@ -76,11 +88,9 @@ def main():
     parser.add_argument('--X', type=str, required=True,
                         help='path to feature matrix (.npy, .csv, or .parquet)')
     parser.add_argument('--Y', type=str, required=True,
-                        help='path to label matrix (.csv, or .parquet); .csv/.parquet column names are used as node names for --rm_root_nodes matching')
+                        help='path to label matrix (.csv, or .parquet); column names are the ontology node IDs')
     parser.add_argument('--ontology', type=str, required=True,
-                        help='path to cl.obo (Cell Ontology in OBO format)')
-    parser.add_argument('--extra_nodes', type=str, nargs='*', default=None,
-                        help='non-ontology labels to add as isolated nodes with no hierarchy constraints (e.g. empty unknown)')
+                        help='path to the preprocessed label hierarchy (node-link .json saved at data prep by preprocess_ontology); never the raw Cell Ontology')
     parser.add_argument('--run_name', type=str, required=True,
                         help='name for this run, used as the logs subfolder')
     
@@ -97,12 +107,10 @@ def main():
                         help='number of hidden layers')
     parser.add_argument('--weight_decay', type=float, required=True,
                         help='weight decay')
-    parser.add_argument('--non_lin', type=str, required=True,
-                        help='non linearity function to be used in the hidden layers')
+    parser.add_argument('--activation', type=str, required=True, choices=list(ACTIVATIONS),
+                        help='activation function for hidden-layer neurons (tanh kept for comparison with the original C-HMCNN, not tuned)')
 
     # Other parameters
-    parser.add_argument('--rm_root_nodes', type=str, nargs='*', default=[],
-                    help='node names to exclude from loss and scoring (e.g. root GO0003674); requires Y in .csv or .parquet format')
     parser.add_argument('--val_ratio', type=float, default=0.3,
                         help='fraction of the data held out for validation (default: 0.3)')
     parser.add_argument('--device', type=int, default=0,
@@ -114,8 +122,20 @@ def main():
     parser.add_argument('--debug', action='store_true',
                         help='write debug outputs (e.g. ontology plot) to the logs folder')
 
+    # wandb (config come from WANDB_PROJECT, WANDB_ENTITY, WANDB_RUN_GROUP env vars)
+    parser.add_argument('--wandb_mode', type=str, default='disabled', choices=['disabled', 'offline', 'online'],
+                        help='W&B logging: disabled (default), offline (log locally, sync later with `wandb sync`), or online')
+
     args = parser.parse_args()
-    hyperparams = {'batch_size':args.batch_size, 'num_layers':args.num_layers, 'dropout':args.dropout, 'non_lin':args.non_lin, 'hidden_dim':args.hidden_dim, 'lr':args.lr, 'weight_decay':args.weight_decay}
+    hyperparams = {
+        'batch_size':args.batch_size, 
+        'num_layers':args.num_layers, 
+        'dropout':args.dropout, 
+        'activation':args.activation, 
+        'hidden_dim':args.hidden_dim, 
+        'lr':args.lr, 
+        'weight_decay':args.weight_decay
+        }
 
     # Set seed
     seed = args.seed
@@ -126,39 +146,58 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+    # Setup wandb
+    use_wandb = args.wandb_mode != 'disabled'
+    if use_wandb:
+        if not _WANDB_AVAILABLE:
+            raise ImportError("wandb is not installed. Run: pip install wandb")
+        wandb.init(mode=args.wandb_mode, name=args.run_name, config=vars(args))
+
     # Pick device
     device = torch.device("cuda:"+str(args.device) if torch.cuda.is_available() else "cpu")
 
     # Load X
     X = load_data(args.X)
-    
+
     # Load Y
     Y = load_data(args.Y)
-    if not isinstance(Y, pd.DataFrame):
+    if not isinstance(Y, pl.DataFrame):
         raise ValueError(f"Y must be a .csv or .parquet file with column names — got {args.Y!r}")
 
-    # Load ontology (pruned to Y columns + all their ancestors)
-    initial_nodes = list(Y.columns)
-    extra_nodes = set(args.extra_nodes) if args.extra_nodes else set()
-    ontology_nodes = [n for n in initial_nodes if n not in extra_nodes]
-    g = load_cell_ontology(args.ontology, nodes=ontology_nodes, extra_nodes=args.extra_nodes)
+    # Load ontology graph
+    with open(args.ontology) as f:
+        g = nx.node_link_graph(json.load(f), directed=True, edges="edges")
+        
+    # sanity check: every Y column must be a node in g
+    unknown_cols = set(Y.columns) - set(g.nodes())
+    if unknown_cols:
+        raise ValueError(f"Y columns missing from the ontology: {sorted(unknown_cols)}")
 
     if args.debug:
+        # plot ontology
         plot_ontology(g, output_path=f"logs/{args.run_name}/ontology.html")
 
     # Include all ancestor nodes of Y and propoagate positive labels updward (e.g. CD8+ T cell → T cell = 1, lymphocyte = 1, leukocyte = 1, ...)
     Y = propagate_labels(Y, g)
 
-    # Remove requested root nodes from loss and scoring
-    if args.rm_root_nodes:
-        missing = set(args.rm_root_nodes) - set(Y.columns)
-        if missing:
-            raise ValueError(f"--rm_root_nodes contains names not found in Y columns: {sorted(missing)}")
-    to_eval = ~Y.columns.isin(args.rm_root_nodes)
-    
+    # Sanity check: no label may be True for every pixel
+    invariant_labels = (
+        Y.select(pl.all()                            # across all cols
+                 .all()                              # check if all true
+                 )
+         .unpivot()                                  # long format: variable (label) | value (bool)
+         .filter(pl.col("value"))                    # keep labels that are True for every pixel
+         .get_column("variable").to_list()
+    )
+    if invariant_labels:
+        raise ValueError(
+            f"Labels True for every pixel after propagation: {invariant_labels}. "
+            f"Use the preprocessed ontology (preprocess_ontology drops the common ancestors of all labels)."
+        )
+
     # Y data management for input
-    Y = Y.values                # only Y values for model input
-    nodes = list(Y.columns)     # use expanded nodes for hierarchy
+    nodes = Y.columns           # use expanded nodes for hierarchy (before Y becomes an array)
+    Y = Y.to_numpy()            # only Y values for model input
 
     # Build R from expanded full node set
     R = torch.tensor(compute_R(g, nodes)).unsqueeze(0).to(device)                               # R_ij = 1 if i is an ancestor of j. Shape (1, n(nodes), n(nodes)) for broadcasting to batch dimension
@@ -171,8 +210,8 @@ def main():
     scaler = preprocessing.StandardScaler().fit(train_X)                                        # z-score scale X
     train_X = torch.tensor(scaler.transform(train_X)).to(device)
     val_X = torch.tensor(scaler.transform(val_X)).to(device)
-    train_Y = torch.tensor(train_Y).to(device)
-    val_Y = torch.tensor(val_Y).to(device)
+    train_Y = torch.tensor(train_Y, dtype=torch.float64).to(device)                            # Y is bool (propagate_labels); BCELoss and MCLoss's (1-labels) need float, matching the .double() output
+    val_Y = torch.tensor(val_Y, dtype=torch.float64).to(device)
 
     # Create loaders
     train_dataset = [(x, y) for (x, y) in zip(train_X, train_Y)]
@@ -224,7 +263,7 @@ def main():
             train_output = labels*output.double()
             train_output = get_constr_out(train_output, R)
             train_output = (1-labels)*constr_output.double() + labels*train_output
-            loss = criterion(train_output[:, to_eval], labels[:, to_eval])
+            loss = criterion(train_output, labels)
             predicted = constr_output.data > 0.5
             # Total number of labels
             total_train += labels.size(0) * labels.size(1)
@@ -239,7 +278,7 @@ def main():
         model.eval()
         constr_output = constr_output.to('cpu')
         labels = labels.to('cpu')
-        train_score = average_precision_score(labels[:, to_eval], constr_output.data[:, to_eval], average='micro')
+        train_score = average_precision_score(labels, constr_output.data, average='micro')
 
         for i, (x,y) in enumerate(val_loader):
             x = x.to(device)
@@ -263,7 +302,7 @@ def main():
                 constr_val = torch.cat((constr_val, cpu_constrained_output), dim=0)
                 y_val = torch.cat((y_val, y), dim =0)
 
-        score = average_precision_score(y_val[:, to_eval], constr_val.data[:, to_eval], average='micro')
+        score = average_precision_score(y_val, constr_val.data, average='micro')
 
         if score >= max_score:
             patience = max_patience
@@ -271,13 +310,26 @@ def main():
         else:
             patience = patience - 1
 
-        floss= open('logs/'+str(args.run_name)+'/measures_batch_size_'+str(args.batch_size)+'_lr_'+str(args.lr)+'_weight_decay_'+str(args.weight_decay)+'_seed_'+str(args.seed)+'_num_layers_'+str(args.num_layers)+'._hidden_dim_'+str(args.hidden_dim)+'_dropout_'+str(args.dropout)+'_'+args.non_lin, 'a')
+        floss= open('logs/'+str(args.run_name)+'/measures_batch_size_'+str(args.batch_size)+'_lr_'+str(args.lr)+'_weight_decay_'+str(args.weight_decay)+'_seed_'+str(args.seed)+'_num_layers_'+str(args.num_layers)+'._hidden_dim_'+str(args.hidden_dim)+'_dropout_'+str(args.dropout)+'_'+args.activation, 'a')
         floss.write('\nEpoch: {} - Loss: {:.4f}, Accuracy train: {:.5f}, Accuracy: {:.5f}, Precision score: ({:.5f})\n'.format(epoch,
                     loss, float(correct_train)/float(total_train), float(correct)/float(total), score))
         floss.close()
 
+        if use_wandb:
+            wandb.log({
+                'epoch':      epoch,
+                'train_loss': float(loss),
+                'train_ap':   float(train_score),
+                'val_ap':     float(score),
+                'train_acc':  float(correct_train) / float(total_train),
+                'val_acc':    float(correct) / float(total),
+            })
+
         if patience == 0:
             break
+
+    if use_wandb:
+        wandb.finish()
 
 if __name__ == "__main__":
     main()
