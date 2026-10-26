@@ -34,11 +34,10 @@ ACTIVATIONS = {
 
 def get_constr_out(x, R):
     """ Given the output of the neural network x returns the output of MCM given the hierarchy constraint expressed in the matrix R """
-    c_out = x.double()
-    c_out = c_out.unsqueeze(1)
+    c_out = x.unsqueeze(1)
     c_out = c_out.expand(len(x),R.shape[1], R.shape[1])
     R_batch = R.expand(len(x),R.shape[1], R.shape[1])
-    final_out, _ = torch.max(R_batch*c_out.double(), dim = 2)
+    final_out, _ = torch.max(R_batch*c_out, dim = 2)
     return final_out
 
 
@@ -201,7 +200,7 @@ def main():
     Y = Y.to_numpy()            # only Y values for model input
 
     # Build R from expanded full node set
-    R = torch.tensor(compute_R(g, nodes)).unsqueeze(0).to(device)                               # R_ij = 1 if i is an ancestor of j. Shape (1, n(nodes), n(nodes)) for broadcasting to batch dimension
+    R = torch.tensor(compute_R(g, nodes), dtype=torch.float32).unsqueeze(0).to(device)                              # R_ij = 1 if i is an ancestor of j. Shape (1, n(nodes), n(nodes)) for broadcasting to batch dimension
 
 
     # Train/val split (after label propagation so propagated labels are consistent across splits)
@@ -209,10 +208,10 @@ def main():
 
     # scale and send to tensors to device (e.g gpu)
     scaler = preprocessing.StandardScaler().fit(train_X)                                        # z-score scale X
-    train_X = torch.tensor(scaler.transform(train_X)).to(device)
-    val_X = torch.tensor(scaler.transform(val_X)).to(device)
-    train_Y = torch.tensor(train_Y, dtype=torch.float64).to(device)                            # Y is bool (propagate_labels); BCELoss and MCLoss's (1-labels) need float, matching the .double() output
-    val_Y = torch.tensor(val_Y, dtype=torch.float64).to(device)
+    train_X = torch.tensor(scaler.transform(train_X), dtype=torch.float32).to(device)          # float32 throughout (scaler returns float64)
+    val_X = torch.tensor(scaler.transform(val_X), dtype=torch.float32).to(device)
+    train_Y = torch.tensor(train_Y, dtype=torch.float32).to(device)                            # Y is bool (propagate_labels); BCELoss and MCLoss's (1-labels) need float
+    val_Y = torch.tensor(val_Y, dtype=torch.float32).to(device)
 
     # Create loaders
     train_dataset = [(x, y) for (x, y) in zip(train_X, train_Y)]
@@ -257,13 +256,13 @@ def main():
 
             # Clear gradients w.r.t. parameters
             optimizer.zero_grad()
-            output = model(x.float())
+            output = model(x)
 
             # MCLoss
             constr_output = get_constr_out(output, R)
-            train_output = labels*output.double()
+            train_output = labels*output
             train_output = get_constr_out(train_output, R)
-            train_output = (1-labels)*constr_output.double() + labels*train_output
+            train_output = (1-labels)*constr_output + labels*train_output
             loss = criterion(train_output, labels)
             predicted = constr_output.data > 0.5
             # Total number of labels
@@ -285,7 +284,7 @@ def main():
             x = x.to(device)
             y = y.to(device)
 
-            constrained_output = model(x.float())
+            constrained_output = model(x)
             predicted = constrained_output.data > 0.5
             # Total number of labels
             total = y.size(0) * y.size(1)
