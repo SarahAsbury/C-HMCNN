@@ -16,7 +16,7 @@ from sklearn.metrics import average_precision_score
 import json
 import networkx as nx
 import polars as pl
-from imc_cellannot_utils import load_data, compute_R, plot_ontology, propagate_labels
+from imc_cellannot_utils import load_data, compute_R, plot_ontology, propagate_labels, compute_label_mask
 
 try:
     import wandb
@@ -33,7 +33,7 @@ ACTIVATIONS = {
 
 
 def get_constr_out(x, R):
-    """ Given the output of the neural network x returns the output of MCM given the hierarchy constraint expressed in the matrix R """
+    """ Given the output of the neural network x returns the output of MCM (probability of parent >= max(child)) given the hierarchy expressed in the matrix R """
     c_out = x.unsqueeze(1)
     c_out = c_out.expand(len(x),R.shape[1], R.shape[1])
     R_batch = R.expand(len(x),R.shape[1], R.shape[1])
@@ -110,6 +110,9 @@ def main():
                         help='activation function for hidden-layer neurons (tanh kept for comparison with the original C-HMCNN, not tuned)')
 
     # Other parameters
+    parser.add_argument('--mask_unknown', action=argparse.BooleanOptionalAction, default=True,
+                        help='mask unknown labels (descendants of each pixel\'s deepest label) out of the loss '
+                             '(default); --no-mask_unknown = original C-HMCNN, every label counts')
     parser.add_argument('--val_ratio', type=float, default=0.3,
                         help='fraction of the data held out for validation (default: 0.3)')
     parser.add_argument('--device', type=int, default=0,
@@ -195,6 +198,19 @@ def main():
             f"and drop labels with no positive pixels at data prep."
         )
 
+    # Mask of known (pixel, node) labels; False = unknown (e.g. CD4/CD8 for a pixel gated only as T cell)
+    if args.mask_unknown:
+        M = compute_label_mask(Y, g)
+        assert M.columns == Y.columns and M.shape == Y.shape, "mask must align with Y (same rows and columns)"
+        M = M.to_numpy()
+    else:
+        M = np.ones(Y.shape, dtype=bool)    # original C-HMCNN: every label counts
+
+    # Sanity check: every pixel needs >= 1 known label
+    unlabelled = int((~M.any(axis=1)).sum())
+    if unlabelled:
+        raise ValueError(f"{unlabelled} pixel(s) have no known labels; drop unlabelled pixels at data prep.")
+
     # Y data management for input
     nodes = Y.columns           # use expanded nodes for hierarchy (before Y becomes an array)
     Y = Y.to_numpy()            # only Y values for model input
@@ -204,18 +220,22 @@ def main():
 
 
     # Train/val split (after label propagation so propagated labels are consistent across splits)
-    train_X, val_X, train_Y, val_Y = train_test_split(X, Y, test_size=args.val_ratio, random_state=seed)
+    train_X, val_X, train_Y, val_Y, train_M, val_M = train_test_split(X, Y, M, test_size=args.val_ratio, random_state=seed)
 
     # scale and send to tensors to device (e.g gpu)
     scaler = preprocessing.StandardScaler().fit(train_X)                                        # z-score scale X
-    train_X = torch.tensor(scaler.transform(train_X), dtype=torch.float32).to(device)          # float32 throughout (scaler returns float64)
+    train_X = torch.tensor(scaler.transform(train_X), dtype=torch.float32).to(device)           # float32 throughout (scaler returns float64)
     val_X = torch.tensor(scaler.transform(val_X), dtype=torch.float32).to(device)
-    train_Y = torch.tensor(train_Y, dtype=torch.float32).to(device)                            # Y is bool (propagate_labels); BCELoss and MCLoss's (1-labels) need float
+    
+    train_Y = torch.tensor(train_Y, dtype=torch.float32).to(device)                             # Y is bool but BCELoss and MCLoss's (1-labels) need float
     val_Y = torch.tensor(val_Y, dtype=torch.float32).to(device)
+    
+    train_M = torch.tensor(train_M, dtype=torch.bool).to(device)                                # mask kept as bool; cast to float per batch
+    val_M = torch.tensor(val_M, dtype=torch.bool).to(device)
 
     # Create loaders
-    train_dataset = [(x, y) for (x, y) in zip(train_X, train_Y)]
-    val_dataset = [(x, y) for (x, y) in zip(val_X, val_Y)]
+    train_dataset = torch.utils.data.TensorDataset(train_X, train_Y, train_M)
+    val_dataset = torch.utils.data.TensorDataset(val_X, val_Y, val_M)
 
     train_loader = torch.utils.data.DataLoader(dataset=train_dataset,
                                             batch_size=args.batch_size,
@@ -232,7 +252,7 @@ def main():
     model = ConstrainedFFNNModel(X.shape[1], args.hidden_dim, Y.shape[1], hyperparams, R)
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    criterion = nn.BCELoss()
+    criterion = nn.BCELoss(reduction='none')                                                     # per-(pixel, node) loss, so the mask can be applied
 
     # Set patience
     patience, max_patience = 20, 20
@@ -249,21 +269,22 @@ def main():
 
         train_score = 0
 
-        for i, (x, labels) in enumerate(train_loader):
+        for i, (x, labels, mask) in enumerate(train_loader):
 
             x = x.to(device)
             labels = labels.to(device)
+            mask = mask.to(device).float()
 
             # Clear gradients w.r.t. parameters
             optimizer.zero_grad()
             output = model(x)
 
             # MCLoss
-            constr_output = get_constr_out(output, R)
+            constr_output = get_constr_out(output, R)                                           # full MCM constraint 
             train_output = labels*output
-            train_output = get_constr_out(train_output, R)
-            train_output = (1-labels)*constr_output + labels*train_output
-            loss = criterion(train_output, labels)
+            train_output = get_constr_out(train_output, R)                                      # Maximum descendent probability only calculated on positive labelled descendents
+            train_output = (1-labels)*constr_output + labels*train_output                       # Use the MCM constraint for true-negative labels, and the maximum true descendent probability for true-positive labels
+            loss = (criterion(train_output, labels) * mask).sum() / mask.sum()     # mean BCE over known labels only (>0: checked before training)
             predicted = constr_output.data > 0.5
             # Total number of labels
             total_train += labels.size(0) * labels.size(1)
@@ -280,7 +301,7 @@ def main():
         labels = labels.to('cpu')
         train_score = average_precision_score(labels, constr_output.data, average='micro')
 
-        for i, (x,y) in enumerate(val_loader):
+        for i, (x, y, _) in enumerate(val_loader):                     # mask not used for validation metrics yet (masked eval TODO)
             x = x.to(device)
             y = y.to(device)
 
